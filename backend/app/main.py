@@ -31,3 +31,25 @@ if settings.all_cors_origins:
     )
 
 app.include_router(api_router, prefix=settings.API_V1_STR)
+
+
+# ── Homelab single-container deploy: serve the built SPA same-origin ──────────
+# The Docker image copies frontend/dist -> backend/static; FastAPI serves it and
+# falls back to index.html for client-side routes. Guarded so local dev (separate
+# Vite server) is unaffected. tags=["spa"] is required by custom_generate_unique_id.
+from pathlib import Path as _Path  # noqa: E402
+from fastapi.staticfiles import StaticFiles as _StaticFiles  # noqa: E402
+from starlette.responses import FileResponse as _FileResponse  # noqa: E402
+
+_static_dir = _Path(__file__).resolve().parent.parent / "static"
+if _static_dir.is_dir():
+    app.mount(
+        "/assets", _StaticFiles(directory=_static_dir / "assets"), name="assets"
+    )
+
+    @app.get("/{full_path:path}", include_in_schema=False, tags=["spa"])
+    async def serve_spa(full_path: str) -> _FileResponse:
+        candidate = _static_dir / full_path
+        if full_path and candidate.is_file():
+            return _FileResponse(candidate)
+        return _FileResponse(_static_dir / "index.html")
