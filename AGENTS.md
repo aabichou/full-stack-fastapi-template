@@ -57,6 +57,11 @@ constants and does: create the ghcr repo + CI build, copy `deploy/k8s.yaml` into
 `homelab-k3s` Flux repo (`clusters/tunis/services/<app>/`, replace `APPNAME`, set secrets/hosts),
 register the app, push, reconcile Flux, verify.
 
+**CI/CD is pull-based** (Flux image-automation, like kitchy): CI only builds & pushes
+`ghcr.io/<owner>/<app>:main-<ts>-<sha>`; the cluster scans ghcr, rewrites the deployment's image
+marker, commits it back, and rolls the pod. After the one-time setup, **every push to the app
+repo auto-deploys** — no manual rollout.
+
 Key facts it encodes (so you don't have to): Traefik `IngressRoute` + wildcard TLS (`tls: {}`),
 CNPG Postgres in the `databases` namespace, Zot mirror at `10.43.205.186:5000` (public packages)
 vs a pull secret for private, `ENVIRONMENT=staging` + real secrets (never `changethis`), and the

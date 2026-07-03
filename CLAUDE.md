@@ -15,7 +15,9 @@ commands, and the non-obvious gotchas (Flux `wait: true`, private-package pulls,
 1. Build the domain (models → routes → services → migration → frontend pages). Match the
    patterns in `AGENTS.md`.
 2. Verify locally: `docker compose up -d`, then exercise the API/UI.
-3. Deploy via the skill → app is live at `https://<app>.ts.k8s.cloud.abichou.tn`.
+3. Deploy via the skill → app is live at `https://<app>.ts.k8s.cloud.abichou.tn`. CI/CD is
+   **pull-based** (Flux image-automation): after the one-time setup, **every push auto-deploys** —
+   CI builds `…:main-<ts>-<sha>`, the cluster bumps the marker and rolls the pod.
 
 ## Working notes
 - **Regenerate the client** after any backend endpoint/model change:

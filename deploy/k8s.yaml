@@ -1,10 +1,18 @@
-# Homelab (tunis) manifests for a single-container FastAPI+SPA app with CNPG Postgres.
+# Homelab (tunis) manifests for a single-container FastAPI+SPA app with CNPG Postgres,
+# deployed PULL-BASED via Flux image-automation (CI pushes ghcr.io/aabichou/APPNAME:main-<ts>-<sha>,
+# the ImagePolicy below picks the newest, ImageUpdateAutomation rewrites the marker on the image
+# line and commits it back → Flux rolls the pod). No CI reaches into the cluster.
+#
 # Copy to clusters/tunis/services/APPNAME/ (split into files or keep as one), then:
-#   - replace APPNAME everywhere
-#   - set real hostnames + non-`changethis` SECRET_KEY / passwords
+#   - replace APPNAME everywhere; set real hostnames + non-`changethis` SECRET_KEY / passwords
 #   - keep POSTGRES_PASSWORD identical in the two Secrets
 #   - add `- APPNAME` to clusters/tunis/services/kustomization.yaml
-# Spans two namespaces (APPNAME + databases) => the kustomization.yaml must NOT set a
+# Two out-of-band docker-registry secrets with a GHCR read:packages PAT (the package is private):
+#   kubectl -n flux-system create secret docker-registry ghcr-pull \      # (already exists — shared, for scanning)
+#     --docker-server=ghcr.io --docker-username=aabichou --docker-password=<PAT>
+#   kubectl -n APPNAME     create secret docker-registry ghcr-pull \      # for the pod to pull
+#     --docker-server=ghcr.io --docker-username=aabichou --docker-password=<PAT>
+# Spans namespaces (APPNAME + databases + flux-system) => the kustomization.yaml must NOT set a
 # top-level `namespace:` transformer; every resource names its own namespace.
 ---
 apiVersion: v1
@@ -71,15 +79,15 @@ spec:
       labels:
         app: APPNAME
     spec:
-      # If the ghcr package is PUBLIC: drop imagePullSecrets and use
-      #   image: 10.43.205.186:5000/aabichou/APPNAME:latest   (Zot mirror, the convention)
-      # If PRIVATE: create the pull secret (see the skill) and keep this block.
       imagePullSecrets:
-        - name: ghcr-APPNAME
+        - name: ghcr-pull
       containers:
         - name: APPNAME
-          image: ghcr.io/aabichou/APPNAME:latest
-          imagePullPolicy: Always
+          # The tag is bumped automatically by the ImageUpdateAutomation below via the
+          # `$imagepolicy` marker — leave the marker comment intact. Seed it with a real
+          # main-<ts>-<sha> tag (from the first CI build) so the pod is pullable immediately.
+          image: ghcr.io/aabichou/APPNAME:main-0-0000000 # {"$imagepolicy": "flux-system:APPNAME"}
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8000
           env:
@@ -135,3 +143,60 @@ spec:
         - name: APPNAME
           port: 8000
   tls: {}
+---
+# ── Flux image-automation (in flux-system so it can use the shared ghcr-pull scan
+#    secret + git-credentials write-back that already live there) ──────────────
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImageRepository
+metadata:
+  name: APPNAME
+  namespace: flux-system
+spec:
+  image: ghcr.io/aabichou/APPNAME
+  interval: 5m
+  secretRef:
+    name: ghcr-pull
+---
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImagePolicy
+metadata:
+  name: APPNAME
+  namespace: flux-system
+spec:
+  imageRepositoryRef:
+    name: APPNAME
+  filterTags:
+    pattern: '^main-(?P<ts>[0-9]+)-[0-9a-f]+$'
+    extract: '$ts'
+  policy:
+    numerical:
+      order: asc
+---
+apiVersion: image.toolkit.fluxcd.io/v1
+kind: ImageUpdateAutomation
+metadata:
+  name: APPNAME
+  namespace: flux-system
+spec:
+  interval: 5m
+  sourceRef:
+    kind: GitRepository
+    name: flux-system
+  git:
+    checkout:
+      ref:
+        branch: main
+    commit:
+      author:
+        name: fluxcdbot
+        email: fluxcdbot@users.noreply.github.com
+      messageTemplate: |
+        deploy(APPNAME): image update
+        {{ range $filename, $_ := .Changed.FileChanges -}}
+        - {{ $filename }}
+        {{ end -}}
+    push:
+      branch: main
+  update:
+    path: ./clusters/tunis/services/APPNAME
+    strategy: Setters

@@ -22,10 +22,14 @@ cd myapp && rm -rf .git && git init
 ## Deploy
 Full procedure, cluster constants, go-live commands, and gotchas are in the Claude Code skill
 **`deploy-fastapi-to-homelab-k8s`** (`~/.claude/skills/`). In short:
-1. Push the app repo → CI builds the image to ghcr.
+1. Push the app repo → CI builds & pushes `ghcr.io/<owner>/<app>:main-<ts>-<sha>` to ghcr.
 2. Copy `deploy/k8s.yaml` → `homelab-k3s` repo `clusters/tunis/services/APPNAME/`, replace
    `APPNAME` + secrets/hosts, register it in `services/kustomization.yaml`, push → Flux deploys.
 3. App comes up at `https://APPNAME.ts.k8s.cloud.abichou.tn`.
+
+**Deploy is pull-based** (Flux image-automation): after that one-time setup, every push to the
+app repo builds a newer `main-<ts>-<sha>`; the cluster picks it up, bumps the deployment marker,
+and rolls the pod automatically (~5–10m). No manual redeploy.
 
 Gotchas worth knowing up front: keep `VITE_API_URL` empty; deploy with `ENVIRONMENT=staging`
 and real (non-`changethis`) secrets; a private ghcr package needs a pull secret (or make it

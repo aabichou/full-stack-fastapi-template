@@ -22,11 +22,14 @@ app-side setup.
   `letsencrypt-cloudflare`) is served via the default `TLSStore`.
 - **Hostnames**: `<app>.ts.k8s.cloud.abichou.tn` (Tailscale-private, what the team uses) and/or
   `<app>.external.k8s.cloud.abichou.tn` (public via frpc tunnel). Same wildcard cert covers both.
-- **Registry**: build → `ghcr.io/aabichou/<app>`. In-cluster Zot mirror at
-  `10.43.205.186:5000` **only serves PUBLIC `aabichou/**` packages anonymously**. So either
-  make the ghcr package **public** and use `image: 10.43.205.186:5000/aabichou/<app>:latest`
-  (no pull secret — the convention), **or** keep it private and pull `ghcr.io/aabichou/<app>`
-  directly with an `imagePullSecret` (see Gotchas).
+- **Registry + deploy model**: build → `ghcr.io/aabichou/<app>` (packages are **private**).
+  Deploy is **pull-based via Flux image-automation** (like kitchy): CI pushes a sortable tag
+  `main-<ts>-<sha>`; an `ImageRepository`/`ImagePolicy`/`ImageUpdateAutomation` in `flux-system`
+  scans ghcr, picks the newest, rewrites the `$imagepolicy` marker on the deployment's image
+  line, commits it back to the `homelab-k3s` main branch, and Flux rolls the pod. **No CI
+  reaches into the cluster; a push auto-deploys.** Pods pull ghcr directly using a `ghcr-pull`
+  docker-registry secret (a read:packages PAT), created out-of-band in both `flux-system`
+  (shared — already exists, for scanning) and the app namespace (for the pod).
 - **Postgres**: CloudNative-PG operator. Create a `Cluster` CR in the **`databases`** namespace;
   reach it at `<name>-rw.databases:5432`.
 - **Storage**: `local-path` (default). **Secrets**: plaintext committed `Secret` (no SOPS yet)
@@ -59,8 +62,10 @@ Copy from `templates/` (already present if you cloned the `homelab` fork branch)
 
 ## Step 2 — CI to ghcr (app repo)
 Add **`.github/workflows/build.yml`** (from `templates/github-build.yml`): on push to
-`main`/`master`, build the root `Dockerfile` and push `ghcr.io/${{ github.repository }}:{sha,latest}`.
-Uses the built-in `GITHUB_TOKEN` (`packages: write`).
+`main`/`master`, build the root `Dockerfile` and push two tags —
+`ghcr.io/${{ github.repository }}:main-<ts>-<sha>` (sortable, what the ImagePolicy selects)
+and `:latest`. Built-in `GITHUB_TOKEN` (`packages: write`). Prune the compose/VM template
+workflows; keep `build`, `test-backend`, `playwright`, `pre-commit`, `zizmor` (kitchy's set).
 
 ## Step 3 — k8s manifests (infra repo)
 Create `~/code/infra/mainframe/k8s/clusters/tunis/services/<app>/` from `templates/k8s.yaml`
@@ -69,25 +74,38 @@ a kustomization `namespace:` transformer**; each resource names its own namespac
 `APPNAME` token and set hostnames + a real (non-`changethis`) `SECRET_KEY`/passwords. Resources:
 namespace, `Secret` (SECRET_KEY, FIRST_SUPERUSER_PASSWORD, POSTGRES_PASSWORD), CNPG `Cluster`
 + its bootstrap secret (databases ns), Deployment (env incl. `POSTGRES_SERVER=<app>-pg-rw.databases`,
-health probes on `/api/v1/utils/health-check/`), Service (:8000), IngressRoute, kustomization.
-Then register: add `- <app>` to `clusters/tunis/services/kustomization.yaml`.
+health probes on `/api/v1/utils/health-check/`, image line with the `$imagepolicy` marker +
+`imagePullSecrets: [ghcr-pull]`), Service (:8000), IngressRoute, the **image-automation CRs**
+(flux-system), kustomization (list `image-automation.yaml`). Then register: add `- <app>` to
+`clusters/tunis/services/kustomization.yaml`.
 
 ## Step 4 — Go live (gh is authed as aabichou)
 ```bash
-# App repo -> triggers CI to build the image
+# 1. App repo -> CI builds the first main-<ts>-<sha> image
 cd <app-src>
 gh repo create aabichou/<app> --private --source=. --remote=origin --push
-gh run watch                                   # wait for "Build and Push" to go green
+gh run watch                                   # wait for "Build & Push" to go green
+TAG=$(gh api /user/packages/container/<app>/versions \
+       -q '[.[].metadata.container.tags[]|select(startswith("main-"))]|sort|last')
 
-# Infra repo -> Flux deploys
+# 2. Pod pull secret in the app namespace (scan secret already exists in flux-system)
+export KUBECONFIG=~/code/infra/mainframe/k8s/kubeconfigs/k3s-k8s.yaml
+kubectl create namespace <app> --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n <app> create secret docker-registry ghcr-pull \
+  --docker-server=ghcr.io --docker-username=aabichou --docker-password="$(gh auth token)" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+# 3. Seed the deployment image line with $TAG (keep the marker), then push infra
+sed -i '' "s#image: ghcr.io/aabichou/<app>:[^ ]*#image: ghcr.io/aabichou/<app>:${TAG}#" \
+  ~/code/infra/mainframe/k8s/clusters/tunis/services/<app>/deployment.yaml
 cd ~/code/infra/mainframe/k8s
 git add clusters/tunis/services/<app> clusters/tunis/services/kustomization.yaml
 git commit -m "services: add <app>" && git push
-
-export KUBECONFIG=~/code/infra/mainframe/k8s/kubeconfigs/k3s-k8s.yaml
 kubectl annotate --overwrite gitrepository flux-system -n flux-system reconcile.fluxcd.io/requestedAt="$(date +%s)"
 kubectl annotate --overwrite kustomization services   -n flux-system fluxcd.io/reconcileAt="$(date +%s)"
 ```
+From here it's **hands-off**: every push to the app repo builds a newer `main-<ts>-<sha>`, and
+Flux image-automation bumps the marker + rolls the pod (~5–10m).
 
 ## Step 5 — Verify
 ```bash
@@ -102,17 +120,24 @@ curl -sI https://<app>.ts.k8s.cloud.abichou.tn/    # 200 (serves the SPA; Tailsc
   crash-looping/ImagePullBackOff pod pins Flux at the *old* revision, so pushes don't apply.
   Unstick: `kubectl patch kustomization services -n flux-system --type merge -p '{"spec":{"suspend":true}}'`
   then the same with `false`, then re-annotate to reconcile.
-- **Private ghcr package won't pull via the Zot mirror** (`unauthorized`/`NotFound`). Either:
-  (a) make the package **public** (Package settings → Change visibility — GitHub has **no REST
-  endpoint** for this, UI only) and use the `10.43.205.186:5000/...` mirror image; or
-  (b) keep private and pull ghcr directly:
+- **Private ghcr package needs a `ghcr-pull` secret in TWO places** (the packages are private,
+  matching kitchy): one in `flux-system` for the `ImageRepository` scan (shared — already exists),
+  one in the app namespace for the pod. Both are docker-registry secrets with a `read:packages`
+  PAT, created out-of-band (a `gh auth token` works but can rotate — a dedicated PAT is more
+  durable):
   ```bash
-  kubectl create secret docker-registry ghcr-<app> -n <app> \
-    --docker-server=ghcr.io --docker-username=aabichou --docker-password="$(gh auth token)"
+  kubectl -n flux-system create secret docker-registry ghcr-pull --docker-server=ghcr.io \
+    --docker-username=aabichou --docker-password="$(gh auth token)"   # already present
+  kubectl -n <app>       create secret docker-registry ghcr-pull --docker-server=ghcr.io \
+    --docker-username=aabichou --docker-password="$(gh auth token)"
   ```
-  then set `image: ghcr.io/aabichou/<app>:latest` + `imagePullSecrets: [{name: ghcr-<app>}]`.
-  The gh CLI token has `read:packages` and works; note it's not GitOps-tracked and can expire —
-  the durable choice is a public package.
+  (The old Zot mirror `10.43.205.186:5000/...` only serves **public** `aabichou/**` — kitchy
+  dropped it because it's unreachable for private images; we pull ghcr directly instead.)
+- **Seed the image tag.** The `$imagepolicy` marker line needs a real `main-<ts>-<sha>` tag to
+  start (so the pod pulls before the automation's first ~5m scan). Grab it from
+  `gh api /user/packages/container/<app>/versions` after the first CI build.
+- **Image tags must match the ImagePolicy** `^main-(?P<ts>[0-9]+)-[0-9a-f]+$` (the CI produces
+  exactly this); `:latest` is pushed too but the policy ignores it.
 - **`ENVIRONMENT` vs `changethis`.** The template's config *raises* (not warns) on any
   `changethis` secret unless `ENVIRONMENT=local`. Deploy with `ENVIRONMENT=staging` and real
   values for `SECRET_KEY`, `POSTGRES_PASSWORD`, `FIRST_SUPERUSER_PASSWORD`.
@@ -125,9 +150,10 @@ curl -sI https://<app>.ts.k8s.cloud.abichou.tn/    # 200 (serves the SPA; Tailsc
   wiring — verify before telling a non-tailnet team to use it).
 
 ## Redeploy after a code change
-Push to `main` → CI rebuilds `:latest` → `kubectl -n <app> rollout restart deploy/<app>`
-(pod re-pulls `:latest`). More deterministic: pin `image:` to the new `:<sha>` and commit the
-infra repo (GitOps drives the rollout).
+**Just push to the app repo.** CI builds a newer `main-<ts>-<sha>`; Flux image-automation
+selects it, commits the marker bump to `homelab-k3s`, and rolls the pod automatically (~5–10m).
+Nothing manual. (To force it: `kubectl -n flux-system annotate imagerepository/<app> --overwrite
+reconcile.fluxcd.io/requestedAt="$(date +%s)"`.)
 
 ## Reusable base
 `git clone -b homelab https://github.com/aabichou/full-stack-fastapi-template <new>` gives you a
